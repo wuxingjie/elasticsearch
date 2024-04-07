@@ -226,6 +226,9 @@ public class RestSearchAction extends BaseRestHandler {
                 request.paramAsBoolean("ccs_minimize_roundtrips", searchRequest.isCcsMinimizeRoundtrips())
             );
         }
+        searchRequest.setCcsIncludeSourceAtFirstTime(
+            request.paramAsBoolean("ccs_include_source_at_first_time", searchRequest.isCcsIncludeSourceAtFirstTime())
+        );
         if (request.paramAsBoolean("force_synthetic_source", false)) {
             searchRequest.setForceSyntheticSource(true);
         }

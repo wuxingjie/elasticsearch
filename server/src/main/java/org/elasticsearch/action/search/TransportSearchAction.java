@@ -52,19 +52,24 @@ import org.elasticsearch.common.util.concurrent.CountDown;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexNotFoundException;
+import org.elasticsearch.index.query.IdsQueryBuilder;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.Rewriteable;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.shard.ShardNotFoundException;
 import org.elasticsearch.indices.ExecutorSelector;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.SearchHits;
 import org.elasticsearch.search.SearchPhaseResult;
 import org.elasticsearch.search.SearchService;
 import org.elasticsearch.search.aggregations.AggregationReduceContext;
 import org.elasticsearch.search.aggregations.InternalAggregations;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.fetch.subphase.FetchSourceContext;
 import org.elasticsearch.search.internal.AliasFilter;
 import org.elasticsearch.search.internal.InternalSearchResponse;
 import org.elasticsearch.search.internal.SearchContext;
@@ -93,6 +98,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -579,6 +585,105 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 }
             });
         } else {
+            ActionListener<SearchResponse> handleSourceListener = listener;
+            FetchSourceContext originalSourceContext = searchRequest.source().fetchSource();
+            if(!searchRequest.isCcsIncludeSourceAtFirstTime()
+                && (originalSourceContext == null || originalSourceContext.fetchSource())
+                && remoteIndices.size() > 0)
+            {
+                // 不查询source
+                searchRequest.source().fetchSource(false);
+                int size = searchRequest.source().size();
+                handleSourceListener = listener.delegateFailure((delegate, response) -> {
+                    SearchHits hits = response.getHits();
+                    SearchHit[] hitArray = hits != null ? hits.getHits() : new SearchHit[0];
+                    Map<String, List<SearchHit>> clusterIds = Arrays.stream(hitArray)
+                        .map(hit -> Tuple.tuple(hit.getClusterAlias(), hit))
+                        .collect(Collectors.groupingBy(
+                            Tuple::v1,
+                            HashMap::new,
+                            Collectors.mapping(Tuple::v2,Collectors.toList())
+                        ));
+                    String[] allIds = Arrays.stream(hitArray).map(SearchHit::getId).toArray(String[]::new);
+                    CountDown countDown = new CountDown(clusterIds.keySet().size());
+                    List<SearchResponse> searchResponses = new CopyOnWriteArrayList<>();
+                    clusterIds.forEach((cluster, docs) -> {
+                        String[] indices =
+                            docs.stream()
+                                .map(hit -> {
+                                    String clusterName = hit.getClusterAlias();
+                                    if(clusterName.equals(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY)) {
+                                        return hit.getIndex();
+                                    } else {
+                                        return clusterName + RemoteClusterAware.REMOTE_CLUSTER_INDEX_SEPARATOR + hit.getIndex();
+                                    }
+                                })
+                                .collect(Collectors.toSet())
+                                .toArray(String[]::new);
+                        String[] ids =
+                            docs.stream()
+                                .map(SearchHit::getId)
+                                .collect(Collectors.toSet())
+                                .toArray(String[]::new);
+                        Client remoteClusterClient = remoteClusterService.getRemoteClusterClient(
+                            threadPool,
+                            cluster,
+                            remoteClientResponseExecutor
+                        );
+                        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder();
+                        sourceBuilder.from(0);
+                        sourceBuilder.size(size);
+                        // 第二次查询带上source
+                        sourceBuilder.fetchSource(originalSourceContext);
+                        IdsQueryBuilder idsQueryBuilder = new IdsQueryBuilder();
+                        idsQueryBuilder.addIds(ids);
+                        sourceBuilder.query(idsQueryBuilder);
+                        SearchRequest idRequest = new SearchRequest(indices, sourceBuilder);
+                        remoteClusterClient.search(idRequest, new ActionListener<>() {
+                            @Override
+                            public void onResponse(SearchResponse searchResponse) {
+                                searchResponses.add(searchResponse);
+                                // 如果数据到齐了
+                                if (countDown.countDown()) {
+                                    Map<String, SearchHit> hitMap = searchResponses.stream()
+                                        .map(SearchResponse::getHits)
+                                        .flatMap(hits -> Arrays.stream(hits.getHits()))
+                                        .collect(Collectors.toMap(SearchHit::getId, h -> h));
+                                    SearchHit[] withSourceHits = Arrays.stream(allIds).map(hitMap::get).toArray(SearchHit[]::new);
+                                    SearchHits originalHits = response.getHits();
+                                    SearchResponse finalResponse =
+                                        new SearchResponse(
+                                            new SearchResponseSections(
+                                                new SearchHits(withSourceHits,originalHits.getTotalHits(),originalHits.getMaxScore()),
+                                                response.getAggregations(),
+                                                response.getSuggest(),
+                                                response.isTimedOut(),
+                                                response.isTerminatedEarly(),
+                                                new SearchProfileResults(response.getProfileResults()),
+                                                response.getNumReducePhases()
+                                            ),
+                                            response.getScrollId(),
+                                            response.getTotalShards(),
+                                            response.getSuccessfulShards(),
+                                            response.getSkippedShards(),
+                                            timeProvider.buildTookInMillis(),
+                                            response.getShardFailures(),
+                                            response.getClusters(),
+                                            response.pointInTimeId()
+                                        );
+                                    delegate.onResponse(finalResponse);
+                                }
+                            }
+
+                            @Override
+                            public void onFailure(Exception e) {
+                                delegate.onFailure(e);
+                            }
+                        });
+                    });
+                });
+            }
+
             SearchResponseMerger searchResponseMerger = createSearchResponseMerger(
                 searchRequest.source(),
                 timeProvider,
@@ -606,7 +711,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     exceptions,
                     searchResponseMerger,
                     clusters,
-                    listener
+                    handleSourceListener
                 );
                 Client remoteClusterClient = remoteClusterService.getRemoteClusterClient(
                     threadPool,
@@ -623,7 +728,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     exceptions,
                     searchResponseMerger,
                     clusters,
-                    listener
+                    handleSourceListener
                 );
                 SearchRequest ccsLocalSearchRequest = SearchRequest.subSearchRequest(
                     parentTaskId,

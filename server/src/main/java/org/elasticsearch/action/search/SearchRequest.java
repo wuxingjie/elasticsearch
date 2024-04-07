@@ -93,6 +93,8 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
 
     private boolean ccsMinimizeRoundtrips;
 
+    private boolean ccsIncludeSourceAtFirstTime;
+
     @Nullable
     private final Version minCompatibleShardNode;
 
@@ -207,6 +209,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
         this.allowPartialSearchResults = searchRequest.allowPartialSearchResults;
         this.batchedReduceSize = searchRequest.batchedReduceSize;
         this.ccsMinimizeRoundtrips = searchRequest.ccsMinimizeRoundtrips;
+        this.ccsIncludeSourceAtFirstTime = searchRequest.ccsIncludeSourceAtFirstTime;
         this.indices = indices;
         this.indicesOptions = searchRequest.indicesOptions;
         this.maxConcurrentShardRequests = searchRequest.maxConcurrentShardRequests;
@@ -264,6 +267,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             finalReduce = true;
         }
         ccsMinimizeRoundtrips = in.readBoolean();
+        ccsIncludeSourceAtFirstTime = in.readBoolean();
         if (in.readBoolean()) {
             minCompatibleShardNode = Version.readVersion(in);
         } else {
@@ -303,6 +307,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             out.writeBoolean(finalReduce);
         }
         out.writeBoolean(ccsMinimizeRoundtrips);
+        out.writeBoolean(ccsIncludeSourceAtFirstTime);
         out.writeBoolean(minCompatibleShardNode != null);
         if (minCompatibleShardNode != null) {
             Version.writeVersion(minCompatibleShardNode, out);
@@ -518,10 +523,25 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
     }
 
     /**
+     *  第一次css查询是否带source字段,如果设置false,先查询id列表,再通过id查询source数据
+     *  默认false
+     */
+    public boolean isCcsIncludeSourceAtFirstTime() {
+        return ccsIncludeSourceAtFirstTime;
+    }
+
+    /**
      * Sets whether network round-trips should be minimized when executing cross-cluster search requests. Defaults to <code>true</code>.
      */
     public void setCcsMinimizeRoundtrips(boolean ccsMinimizeRoundtrips) {
         this.ccsMinimizeRoundtrips = ccsMinimizeRoundtrips;
+    }
+
+    /**
+     * 设置第一次是否带source字段, 默认false
+     */
+    public void setCcsIncludeSourceAtFirstTime(boolean ccsIncludeSourceAtFirstTime) {
+        this.ccsIncludeSourceAtFirstTime = ccsIncludeSourceAtFirstTime;
     }
 
     /**
@@ -892,6 +912,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             && Objects.equals(localClusterAlias, that.localClusterAlias)
             && absoluteStartMillis == that.absoluteStartMillis
             && ccsMinimizeRoundtrips == that.ccsMinimizeRoundtrips
+            && ccsIncludeSourceAtFirstTime == that.ccsIncludeSourceAtFirstTime
             && Objects.equals(minCompatibleShardNode, that.minCompatibleShardNode)
             && forceSyntheticSource == that.forceSyntheticSource;
     }
@@ -914,6 +935,7 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             localClusterAlias,
             absoluteStartMillis,
             ccsMinimizeRoundtrips,
+            ccsIncludeSourceAtFirstTime,
             minCompatibleShardNode,
             forceSyntheticSource
         );
@@ -951,7 +973,9 @@ public class SearchRequest extends ActionRequest implements IndicesRequest.Repla
             + ", getOrCreateAbsoluteStartMillis="
             + absoluteStartMillis
             + ", ccsMinimizeRoundtrips="
-            + ccsMinimizeRoundtrips
+            + ccsIncludeSourceAtFirstTime
+            + ", ccsIncludeSourceAtFirstTime="
+            + ccsIncludeSourceAtFirstTime
             + ", source="
             + source
             + '}';
