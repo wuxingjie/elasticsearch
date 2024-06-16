@@ -90,6 +90,7 @@ import org.elasticsearch.xcontent.XContentFactory;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -587,100 +588,122 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         } else {
             ActionListener<SearchResponse> handleSourceListener = listener;
             FetchSourceContext originalSourceContext = searchRequest.source().fetchSource();
-            if(!searchRequest.isCcsIncludeSourceAtFirstTime()
+            if(searchRequest.isCcsIncludeSourceAtFirstTime() == false
                 && (originalSourceContext == null || originalSourceContext.fetchSource())
-                && remoteIndices.size() > 0)
+                && remoteIndices.isEmpty() == false)
             {
-                // 不查询source
+                // remote cluster不查询source
                 searchRequest.source().fetchSource(false);
                 int size = searchRequest.source().size();
-                handleSourceListener = listener.delegateFailure((delegate, response) -> {
+                // 这里listener的response是合并后的,不包含source的
+                handleSourceListener = listener.delegateFailureAndWrap((delegate, response) -> {
                     SearchHits hits = response.getHits();
                     SearchHit[] hitArray = hits != null ? hits.getHits() : new SearchHit[0];
-                    Map<String, List<SearchHit>> clusterIds = Arrays.stream(hitArray)
+                    // 所有的集群hits,包括本地集群
+                    // key -> clusterAlias, value -> hits
+                    Map<String, List<SearchHit>> allClusterHits = Arrays.stream(hitArray)
                         .map(hit -> Tuple.tuple(hit.getClusterAlias(), hit))
                         .collect(Collectors.groupingBy(
                             Tuple::v1,
                             HashMap::new,
-                            Collectors.mapping(Tuple::v2,Collectors.toList())
+                            Collectors.mapping(Tuple::v2, Collectors.toList())
                         ));
-                    String[] allIds = Arrays.stream(hitArray).map(SearchHit::getId).toArray(String[]::new);
-                    CountDown countDown = new CountDown(clusterIds.keySet().size());
-                    List<SearchResponse> searchResponses = new CopyOnWriteArrayList<>();
-                    clusterIds.forEach((cluster, docs) -> {
-                        String[] indices =
-                            docs.stream()
-                                .map(hit -> {
-                                    String clusterName = hit.getClusterAlias();
-                                    if(clusterName.equals(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY)) {
-                                        return hit.getIndex();
-                                    } else {
-                                        return clusterName + RemoteClusterAware.REMOTE_CLUSTER_INDEX_SEPARATOR + hit.getIndex();
+                    // 远程集群hits,不包括本地集群
+                    // key -> clusterAlias, value -> hits
+                    Map<String, List<SearchHit>> remoteClusterHits =
+                        allClusterHits.entrySet()
+                            .stream()
+                            .filter(e -> e.getKey().equals(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY) == false)
+                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+                    List<List<SearchHit>> allSourceHits = new CopyOnWriteArrayList<>();
+                    // 先把本地集群hits加进去
+                    if(allClusterHits.containsKey(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY)) {
+                        allSourceHits.add(allClusterHits.get(RemoteClusterAware.LOCAL_CLUSTER_GROUP_KEY));
+                    }
+                    // 数据齐了,返回数据
+                    Runnable doResponse = () -> {
+                        Map<String, SearchHit> withSourcehitMap = allSourceHits.stream()
+                            .flatMap(Collection::stream)
+                            .collect(Collectors.toMap(SearchHit::getId, h -> h));
+                        for (SearchHit originalHit : hitArray) {
+                            if(withSourcehitMap.containsKey(originalHit.getId())) {
+                                // 替换source
+                                originalHit.sourceRef(withSourcehitMap.get(originalHit.getId()).getSourceRef());
+                            }
+                        }
+                        SearchHits originalHits = response.getHits();
+                        SearchResponse finalResponse =
+                            new SearchResponse(
+                                new SearchResponseSections(
+                                    new SearchHits(hitArray, originalHits.getTotalHits(), originalHits.getMaxScore()),
+                                    response.getAggregations(),
+                                    response.getSuggest(),
+                                    response.isTimedOut(),
+                                    response.isTerminatedEarly(),
+                                    new SearchProfileResults(response.getProfileResults()),
+                                    response.getNumReducePhases()
+                                ),
+                                response.getScrollId(),
+                                response.getTotalShards(),
+                                response.getSuccessfulShards(),
+                                response.getSkippedShards(),
+                                timeProvider.buildTookInMillis(),
+                                response.getShardFailures(),
+                                response.getClusters(),
+                                response.pointInTimeId()
+                            );
+                        delegate.onResponse(finalResponse);
+                    };
+                    // 远程集群都没有命中的数据
+                    if (remoteClusterHits.isEmpty()) {
+                        doResponse.run();
+                    } else {
+                        CountDown countDown = new CountDown(remoteClusterHits.size());
+                        // 遍历所有远程集群带source查询
+                        remoteClusterHits.forEach((cluster, docs) -> {
+                            String[] indices =
+                                docs.stream()
+                                    .map(SearchHit::getIndex)
+                                    .collect(Collectors.toSet())
+                                    .toArray(String[]::new);
+                            String[] ids =
+                                docs.stream()
+                                    .map(SearchHit::getId)
+                                    .collect(Collectors.toSet())
+                                    .toArray(String[]::new);
+                            Client remoteClusterClient = remoteClusterService.getRemoteClusterClient(
+                                threadPool,
+                                cluster,
+                                remoteClientResponseExecutor
+                            );
+                            SearchSourceBuilder sourceBuilder = new SearchSourceBuilder();
+                            sourceBuilder.from(0);
+                            sourceBuilder.size(size);
+                            sourceBuilder.highlighter(searchRequest.source().highlighter());
+                            // 第二次查询带上source
+                            sourceBuilder.fetchSource(originalSourceContext);
+                            IdsQueryBuilder idsQueryBuilder = new IdsQueryBuilder();
+                            idsQueryBuilder.addIds(ids);
+                            sourceBuilder.query(idsQueryBuilder);
+                            SearchRequest idRequest = new SearchRequest(indices, sourceBuilder);
+                            remoteClusterClient.search(idRequest, new ActionListener<>() {
+                                @Override
+                                public void onResponse(SearchResponse searchResponse) {
+                                    allSourceHits.add(List.of(searchResponse.getHits().getHits()));
+                                    // 如果数据到齐了
+                                    if (countDown.countDown()) {
+                                        doResponse.run();
                                     }
-                                })
-                                .collect(Collectors.toSet())
-                                .toArray(String[]::new);
-                        String[] ids =
-                            docs.stream()
-                                .map(SearchHit::getId)
-                                .collect(Collectors.toSet())
-                                .toArray(String[]::new);
-                        Client remoteClusterClient = remoteClusterService.getRemoteClusterClient(
-                            threadPool,
-                            cluster,
-                            remoteClientResponseExecutor
-                        );
-                        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder();
-                        sourceBuilder.from(0);
-                        sourceBuilder.size(size);
-                        // 第二次查询带上source
-                        sourceBuilder.fetchSource(originalSourceContext);
-                        IdsQueryBuilder idsQueryBuilder = new IdsQueryBuilder();
-                        idsQueryBuilder.addIds(ids);
-                        sourceBuilder.query(idsQueryBuilder);
-                        SearchRequest idRequest = new SearchRequest(indices, sourceBuilder);
-                        remoteClusterClient.search(idRequest, new ActionListener<>() {
-                            @Override
-                            public void onResponse(SearchResponse searchResponse) {
-                                searchResponses.add(searchResponse);
-                                // 如果数据到齐了
-                                if (countDown.countDown()) {
-                                    Map<String, SearchHit> hitMap = searchResponses.stream()
-                                        .map(SearchResponse::getHits)
-                                        .flatMap(hits -> Arrays.stream(hits.getHits()))
-                                        .collect(Collectors.toMap(SearchHit::getId, h -> h));
-                                    SearchHit[] withSourceHits = Arrays.stream(allIds).map(hitMap::get).toArray(SearchHit[]::new);
-                                    SearchHits originalHits = response.getHits();
-                                    SearchResponse finalResponse =
-                                        new SearchResponse(
-                                            new SearchResponseSections(
-                                                new SearchHits(withSourceHits,originalHits.getTotalHits(),originalHits.getMaxScore()),
-                                                response.getAggregations(),
-                                                response.getSuggest(),
-                                                response.isTimedOut(),
-                                                response.isTerminatedEarly(),
-                                                new SearchProfileResults(response.getProfileResults()),
-                                                response.getNumReducePhases()
-                                            ),
-                                            response.getScrollId(),
-                                            response.getTotalShards(),
-                                            response.getSuccessfulShards(),
-                                            response.getSkippedShards(),
-                                            timeProvider.buildTookInMillis(),
-                                            response.getShardFailures(),
-                                            response.getClusters(),
-                                            response.pointInTimeId()
-                                        );
-                                    delegate.onResponse(finalResponse);
                                 }
-                            }
 
-                            @Override
-                            public void onFailure(Exception e) {
-                                delegate.onFailure(e);
-                            }
+                                @Override
+                                public void onFailure(Exception e) {
+                                    delegate.onFailure(e);
+                                }
+                            });
                         });
-                    });
+                    }
+
                 });
             }
 
@@ -730,6 +753,8 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     clusters,
                     handleSourceListener
                 );
+                // 本地集群还原fetchSource配置,本地集群直接查询,不用先拿ID
+                searchRequest.source().fetchSource(originalSourceContext);
                 SearchRequest ccsLocalSearchRequest = SearchRequest.subSearchRequest(
                     parentTaskId,
                     searchRequest,
